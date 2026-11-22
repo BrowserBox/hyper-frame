@@ -736,7 +736,7 @@ const METHOD_CAPABILITY_MAP = {
 };
 
 const EVENT_ALIAS_MAP = {
-  'api-ready': ['api.ready', 'ready'],
+  'api-ready': ['api.ready'],
   'usability-changed': ['session.usability.changed'],
   'iframe-retry': ['session.retry'],
   disconnected: ['session.disconnected'],
@@ -2993,6 +2993,7 @@ class HyperFrame extends HTMLElement {
       }
       const wasReady = this._state === 'ready';
       this._setState('ready', 'api-ready');
+      this._emitBrowserBoxEvent('ready', { type: 'tab-api-ready' });
       this._emitBrowserBoxEvent('api-ready', payload.data || {});
       if (!wasReady) this._resetTabsToCleanSlate();
       return;
