@@ -1448,7 +1448,7 @@ class HyperFrame extends HTMLElement {
       this._rememberError(error);
       this._rejectPending(error);
       this._rejectReadyWaiters(error);
-      if (prevState !== 'failed') {
+      if (prevState === 'ready' || (prevState !== 'failed' && nextReason.startsWith('sos:'))) {
         this._emitBrowserBoxEvent('usability-changed', {
           usable: false,
           state: 'failed',
