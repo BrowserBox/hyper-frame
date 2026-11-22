@@ -2130,7 +2130,6 @@ class HyperFrame extends HTMLElement {
             mid: this._routingMid,
           },
         }));
-        this._setState('failed', 'mid-sync-timeout');
         return;
       }
       this._midSyncAttempt += 1;
