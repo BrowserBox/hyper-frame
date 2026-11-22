@@ -596,9 +596,11 @@ function createSessionFacade(instance) {
 
   Object.defineProperties(session, {
     id: readOnlyProperty(() => instance.routingMid || null),
-    usable: readOnlyProperty(() => instance._usable),
+    state: readOnlyProperty(() => instance._state),
+    reason: readOnlyProperty(() => instance._stateReason),
+    usable: readOnlyProperty(() => instance._state === 'ready'),
     transport: readOnlyProperty(() => instance._transportMode),
-    ready: readOnlyProperty(() => instance._isReady),
+    ready: readOnlyProperty(() => instance._state === 'ready'),
     tabs: readOnlyProperty(() => instance.tabs),
     page: readOnlyProperty(() => instance.page),
     capture: readOnlyProperty(() => instance.capture),
@@ -724,6 +726,7 @@ const METHOD_CAPABILITY_MAP = {
   uiVisible: ['page.read'],
   allowUserToggleUI: ['page.read'],
   getTransportDiagnostics: ['events.read'],
+  getSessionDiagnostics: ['events.read'],
   getCurrentModal: ['modals.read'],
   respondToModal: ['modals.respond'],
   dismissModal: ['modals.respond'],
@@ -733,7 +736,7 @@ const METHOD_CAPABILITY_MAP = {
 };
 
 const EVENT_ALIAS_MAP = {
-  'api-ready': ['api.ready'],
+  'api-ready': ['api.ready', 'ready'],
   'usability-changed': ['session.usability.changed'],
   'iframe-retry': ['session.retry'],
   disconnected: ['session.disconnected'],
@@ -1198,9 +1201,9 @@ class HyperFrame extends HTMLElement {
     this._requestSeq = 0;
     this._pending = new Map();
     this._apiMethods = [];
-    this._isReady = false;
-    this._usable = false;
-    this._readyPromise = Promise.resolve(true);
+    this._state = 'connecting';
+    this._stateReason = 'init';
+    this._readyWaiters = new Set();
     this._initPingTimer = null;
     this._transportMode = 'unknown';
     this._legacyTabsCache = [];
@@ -1210,7 +1213,6 @@ class HyperFrame extends HTMLElement {
     this._iframeRetryMax = 5;
     this._iframeRetryPingThreshold = 30; // pings (1s each) before retry — covers ~90s cold starts
     this._initPingCount = 0;
-    this._reconnectStopped = false;
     this._silentRecoveryUsed = false;
     this._silentRecoveryParam = 'bbx_embed_retry';
 
@@ -1258,7 +1260,6 @@ class HyperFrame extends HTMLElement {
     this._boundVisibilityChange = () => this._handleResumeTrigger('document-visibility');
     this._boundPageShow = () => this._handleResumeTrigger('page-show');
     this._boundWindowFocus = () => this._handleResumeTrigger('window-focus');
-    this._resetReadyPromise();
     this.tabs = createTabsNamespace(this);
     this.page = createPageNamespace(this);
     this.capture = createCaptureNamespace(this);
@@ -1305,14 +1306,7 @@ class HyperFrame extends HTMLElement {
       this._deferredVisibilityRecheckTimer = null;
     }
     this._stopVisibilityPolling();
-    this._stopInitPing();
-    this._stopMidSync();
-    this._rejectPending(createBrowserBoxError('hyper-frame disconnected.', {
-      code: ERROR_CODES.TRANSPORT,
-      retriable: true,
-      status: 503,
-    }));
-    this._setUsable(false, 'disconnected');
+    this._setState('failed', 'disconnected');
     this._emitBrowserBoxEvent('disconnected', {});
   }
 
@@ -1321,22 +1315,15 @@ class HyperFrame extends HTMLElement {
       return;
     }
     if (name === 'login-link') {
-      this._isReady = false;
       this._apiMethods = [];
       this._transportMode = 'unknown';
       this._legacyTabsCache = [];
       this._iframeRetryCount = 0;
       this._initPingCount = 0;
-      this._reconnectStopped = false;
       this._silentRecoveryUsed = false;
       this._lastSuccessfulBootstrapAt = 0;
-      this._resetReadyPromise();
       this._invalidateFrameBootstrap('login-link-changed');
-      this._rejectPending(createBrowserBoxError('hyper-frame source changed.', {
-        code: ERROR_CODES.TRANSPORT,
-        retriable: true,
-        status: 503,
-      }));
+      this._setState('connecting', 'login-link-changed');
       this._emitBrowserBoxEvent('disconnected', {
         reason: 'login-link-changed',
       });
@@ -1375,26 +1362,101 @@ class HyperFrame extends HTMLElement {
     }
   }
 
-  _resetReadyPromise() {
-    this._readyPromise = new Promise((resolve) => {
-      this._resolveReady = resolve;
+  _createNotReadyError(message, {
+    reason = this._stateReason || 'not-ready',
+    retriable = this._state !== 'failed',
+    ...details
+  } = {}) {
+    return createBrowserBoxError(message, {
+      code: ERROR_CODES.NOT_READY,
+      retriable,
+      status: 409,
+      state: this._state,
+      reason,
+      ...details,
     });
   }
 
-  _setReady() {
-    if (!this._isReady) {
-      this._isReady = true;
-      this._setUsable(true, 'ready');
+  _resolveReadyWaiters() {
+    for (const waiter of [...this._readyWaiters]) {
+      this._readyWaiters.delete(waiter);
+      waiter.resolve(true);
+    }
+  }
+
+  _rejectReadyWaiters(error) {
+    for (const waiter of [...this._readyWaiters]) {
+      this._readyWaiters.delete(waiter);
+      waiter.reject(error);
+    }
+  }
+
+  _isReconnectStopped() {
+    return this._state === 'failed' && (
+      this._stateReason === 'session.disconnect'
+      || this._stateReason === 'manual-stop'
+      || this._stateReason === 'iframe-unresponsive'
+      || this._stateReason === 'disconnected'
+    );
+  }
+
+  _setState(nextState, reason = '') {
+    const prevState = this._state;
+    const nextReason = String(reason || nextState);
+    if (nextState === 'ready' && prevState === 'ready') {
+      this._stateReason = nextReason;
+      return;
+    }
+    this._state = nextState;
+    this._stateReason = nextReason;
+
+    if (nextState === 'ready') {
       this._iframeRetryCount = 0;
-      this._reconnectStopped = false;
       this._stopInitPing();
-      if (typeof this._resolveReady === 'function') {
-        this._resolveReady(true);
+      this._resolveReadyWaiters();
+      this._invalidateFrameBootstrap('ready');
+      this._scheduleFrameBootstrap('ready', 120);
+      this._startFrameBootstrapRetries('ready');
+      this._emitBrowserBoxEvent('usability-changed', {
+        usable: true,
+        state: 'ready',
+        reason: nextReason,
+      });
+      return;
+    }
+
+    if (nextState === 'connecting') {
+      this._invalidateFrameBootstrap(`connecting:${nextReason}`);
+      if (prevState === 'ready' || this._pending.size > 0) {
+        const error = this._createNotReadyError(
+          `hyper-frame session not ready (${nextReason}).`,
+          { reason: nextReason, retriable: true },
+        );
+        this._rememberError(error);
+        this._rejectPending(error);
+      }
+      return;
+    }
+
+    if (nextState === 'failed') {
+      this._stopInitPing();
+      this._stopMidSync();
+      this._invalidateFrameBootstrap(`failed:${nextReason}`);
+      const error = this._createNotReadyError(
+        `hyper-frame session failed (${nextReason}).`,
+        { reason: nextReason, retriable: false },
+      );
+      this._rememberError(error);
+      this._rejectPending(error);
+      this._rejectReadyWaiters(error);
+      if (prevState !== 'failed') {
+        this._emitBrowserBoxEvent('usability-changed', {
+          usable: false,
+          state: 'failed',
+          reason: nextReason,
+        });
       }
     }
-    this._invalidateFrameBootstrap('ready');
-    this._scheduleFrameBootstrap('ready', 120);
-    this._startFrameBootstrapRetries('ready');
   }
 
   _rejectPending(error) {
@@ -1403,16 +1465,6 @@ class HyperFrame extends HTMLElement {
       pending.reject(error);
     }
     this._pending.clear();
-  }
-
-  _setUsable(next, reason = '') {
-    const usable = Boolean(next);
-    if (this._usable === usable) return;
-    this._usable = usable;
-    this._emitBrowserBoxEvent('usability-changed', {
-      usable,
-      reason,
-    });
   }
 
   _createAugmentLayer(space) {
@@ -1828,20 +1880,19 @@ class HyperFrame extends HTMLElement {
   }
 
   _handleLoad() {
-    if (this._reconnectStopped) {
+    if (this._isReconnectStopped()) {
       return;
     }
-    const needsReset = this._isReady;
-    this._isReady = false;
+    const wasReady = this._state === 'ready';
     this._apiMethods = [];
     this._transportMode = 'unknown';
     this._legacyTabsCache = [];
     this._initPingCount = 0;
     this._lastSuccessfulBootstrapAt = 0;
-    if (needsReset) {
+    if (wasReady) {
       this._iframeRetryCount = 0;
-      this._resetReadyPromise();
     }
+    this._setState('connecting', 'iframe-load');
     this._midSyncAcked = false;
     this._uiSyncAcked = false;
     this._startMidSync('iframe-load');
@@ -1850,18 +1901,14 @@ class HyperFrame extends HTMLElement {
   }
 
   _startInitPing() {
-    if (this._reconnectStopped) {
+    if (this._isReconnectStopped() || this._state === 'failed') {
       return;
     }
     this._stopInitPing();
     this._initPingCount = 0;
     this._postRaw({ type: 'init' });
     this._initPingTimer = setInterval(() => {
-      if (this._reconnectStopped) {
-        this._stopInitPing();
-        return;
-      }
-      if (this._isReady) {
+      if (this._state === 'ready' || this._state === 'failed') {
         this._stopInitPing();
         return;
       }
@@ -1897,7 +1944,7 @@ class HyperFrame extends HTMLElement {
       delayMs: delay,
     });
     setTimeout(() => {
-      if (this._isReady || this._reconnectStopped) return;
+      if (this._state === 'ready' || this._state === 'failed') return;
       this._assignIframeSrc(src, '_retryIframeLoad');
     }, delay);
   }
@@ -1947,21 +1994,13 @@ class HyperFrame extends HTMLElement {
     }
 
     this._silentRecoveryUsed = true;
-    this._isReady = false;
     this._apiMethods = [];
     this._transportMode = 'unknown';
     this._legacyTabsCache = [];
     this._iframeRetryCount = 0;
     this._initPingCount = 0;
     this._midSyncAcked = false;
-    this._reconnectStopped = false;
-    this._resetReadyPromise();
-    this._rejectPending(createBrowserBoxError(`hyper-frame silent recovery (${reason}).`, {
-      code: ERROR_CODES.TRANSPORT,
-      retriable: true,
-      status: 503,
-      reason,
-    }));
+    this._setState('connecting', 'silent-recovery');
 
     console.info('[hyper-frame] attempting one-shot silent recovery reload', {
       reason,
@@ -2102,7 +2141,7 @@ class HyperFrame extends HTMLElement {
             mid: this._routingMid,
           },
         }));
-        this._setUsable(false, 'mid-sync-timeout');
+        this._setState('failed', 'mid-sync-timeout');
         return;
       }
       this._midSyncAttempt += 1;
@@ -2934,7 +2973,7 @@ class HyperFrame extends HTMLElement {
         forwardedAt: Date.now(),
         forwardedBy: 'hyper-frame',
       };
-      this._setUsable(false, `sos:${reasonCode}`);
+      this._setState('failed', `sos:${reasonCode}`);
       this._emitBrowserBoxEvent('sos', detail);
       this._forwardToParent({
         type: 'bbx-sos',
@@ -2962,10 +3001,6 @@ class HyperFrame extends HTMLElement {
     }
 
     if (payload.type === 'tab-api-ready') {
-      const wasReady = this._isReady;
-      this._setReady();
-      this._emitBrowserBoxEvent('ready', { type: payload.type });
-      if (!wasReady) this._resetTabsToCleanSlate();
       return;
     }
 
@@ -2978,10 +3013,22 @@ class HyperFrame extends HTMLElement {
         this._serverPolicySnapshot = normalizePolicyStateSnapshot(payload.data.policy);
         this._refreshPolicyState('server-policy-ready');
       }
-      const wasReady = this._isReady;
-      this._setReady();
+      const wasReady = this._state === 'ready';
+      this._setState('ready', 'api-ready');
       this._emitBrowserBoxEvent('api-ready', payload.data || {});
       if (!wasReady) this._resetTabsToCleanSlate();
+      return;
+    }
+
+    if (payload.type === 'disconnected') {
+      const reason = typeof payload.data?.reason === 'string' && payload.data.reason.length > 0
+        ? payload.data.reason
+        : 'ws-closed';
+      this._setState('connecting', reason);
+      this._emitBrowserBoxEvent('disconnected', {
+        ...(payload.data && typeof payload.data === 'object' ? payload.data : {}),
+        reason,
+      });
       return;
     }
 
@@ -3007,6 +3054,18 @@ class HyperFrame extends HTMLElement {
   }
 
   _request(type, data = {}, options = {}) {
+    if (this._state !== 'ready') {
+      const error = this._createNotReadyError(
+        `hyper-frame session is not ready (${this._stateReason}).`,
+        {
+          reason: this._stateReason,
+          retriable: this._state !== 'failed',
+          requestType: type,
+        },
+      );
+      this._rememberError(error);
+      return Promise.reject(error);
+    }
     if (!this.iframe.contentWindow) {
       const error = createBrowserBoxError('hyper-frame iframe is not ready.', {
         code: ERROR_CODES.TRANSPORT,
@@ -3080,21 +3139,42 @@ class HyperFrame extends HTMLElement {
   }
 
   async whenReady({ timeoutMs = this.requestTimeoutMs } = {}) {
-    if (this._isReady) {
+    if (this._state === 'ready') {
       return true;
     }
+    if (this._state === 'failed') {
+      throw this._createNotReadyError(
+        `hyper-frame is not ready (${this._stateReason}).`,
+        { reason: this._stateReason, retriable: false },
+      );
+    }
 
-    const timeout = new Promise((_, reject) => {
-      setTimeout(() => reject(createBrowserBoxError(`hyper-frame ready timeout after ${timeoutMs}ms.`, {
-        code: ERROR_CODES.TIMEOUT,
-        retriable: true,
-        status: 504,
-        timeoutMs,
-      })), timeoutMs);
+    return new Promise((resolve, reject) => {
+      const waiter = {
+        resolve: (value) => {
+          clearTimeout(timer);
+          this._readyWaiters.delete(waiter);
+          resolve(value);
+        },
+        reject: (error) => {
+          clearTimeout(timer);
+          this._readyWaiters.delete(waiter);
+          reject(error);
+        },
+      };
+      const timer = setTimeout(() => {
+        this._readyWaiters.delete(waiter);
+        reject(createBrowserBoxError(`hyper-frame ready timeout after ${timeoutMs}ms.`, {
+          code: ERROR_CODES.TIMEOUT,
+          retriable: true,
+          status: 504,
+          timeoutMs,
+          state: this._state,
+          reason: this._stateReason,
+        }));
+      }, timeoutMs);
+      this._readyWaiters.add(waiter);
     });
-
-    await Promise.race([this._readyPromise, timeout]);
-    return true;
   }
 
   on(eventName, handler, options) {
@@ -3199,8 +3279,19 @@ class HyperFrame extends HTMLElement {
   }
 
   async _ensureReadyForApi() {
-    if (this._isReady) {
+    if (this._state === 'ready') {
       return true;
+    }
+    if (this._state === 'failed' || this._stateReason === 'ws-closed') {
+      const error = this._createNotReadyError(
+        `hyper-frame session is not ready (${this._stateReason}).`,
+        {
+          reason: this._stateReason,
+          retriable: this._state !== 'failed',
+        },
+      );
+      this._rememberError(error);
+      throw error;
     }
     const softTimeoutMs = Math.min(this.requestTimeoutMs, 8000);
     try {
@@ -3208,6 +3299,9 @@ class HyperFrame extends HTMLElement {
       return true;
     } catch (error) {
       this._rememberError(error);
+      if (this._state === 'failed' || error?.code === ERROR_CODES.NOT_READY) {
+        throw error;
+      }
       this.dispatchEvent(new CustomEvent('ready-timeout', {
         detail: {
           timeoutMs: softTimeoutMs,
@@ -3304,17 +3398,19 @@ class HyperFrame extends HTMLElement {
     if (typeof method !== 'string' || method.trim().length === 0) {
       throwInvalidArgument('callApi(method, ...args) requires a non-empty method string.');
     }
-    const invoke = async () => {
+    const normalizedMethod = method.trim();
+    try {
       const ready = await this._ensureReadyForApi();
       if (!ready) {
-        throw createBrowserBoxError(`hyper-frame API method '${method}' called before handshake completed.`, {
-          code: ERROR_CODES.NOT_READY,
-          retriable: true,
-          status: 409,
-          method,
-        });
+        throw this._createNotReadyError(
+          `hyper-frame API method '${normalizedMethod}' called before handshake completed.`,
+          {
+            reason: this._stateReason,
+            retriable: true,
+            method: normalizedMethod,
+          },
+        );
       }
-      const normalizedMethod = method.trim();
       for (const capability of this._capabilitiesForMethod(normalizedMethod, args)) {
         this._assertCapability(capability);
       }
@@ -3323,31 +3419,17 @@ class HyperFrame extends HTMLElement {
         await this._resolveTransport();
       }
 
-      if (this._transportMode === 'legacy') {
-        return this._legacyCall(normalizedMethod, args);
-      }
-
-      return this._request('bbx-api-call', { method: normalizedMethod, args }, {
-        timeoutMs: this.requestTimeoutMs,
-      });
-    };
-
-    try {
-      const result = await this._withRetry(invoke, {
-        attempts: 3,
-        baseDelayMs: 300,
-        maxDelayMs: 1500,
-        shouldRetry: (error) => this._isRetryableApiError(error),
-      });
+      const result = this._transportMode === 'legacy'
+        ? await this._legacyCall(normalizedMethod, args)
+        : await this._request('bbx-api-call', { method: normalizedMethod, args }, {
+          timeoutMs: this.requestTimeoutMs,
+        });
       this._rememberError(null);
-      this._setUsable(true, 'api-ok');
       return result;
     } catch (error) {
-      this._rememberError(error);
-      if (this._isRetryableApiError(error)) {
-        this._setUsable(false, 'api-failed');
-      }
-      throw this._normalizeRemoteError(error, { method });
+      const normalizedError = this._normalizeRemoteError(error, { method: normalizedMethod });
+      this._rememberError(normalizedError);
+      throw normalizedError;
     }
   }
 
@@ -3467,6 +3549,7 @@ class HyperFrame extends HTMLElement {
   stop() { return this.callApi('stop'); }
   getScreenMetrics() { return this.callApi('getScreenMetrics'); }
   getTransportDiagnostics() { return this.callApi('getTransportDiagnostics'); }
+  getSessionDiagnostics(options = {}) { return this.callApi('getSessionDiagnostics', options); }
   frameCapture(enabled = true) { return this.callApi('frameCapture', Boolean(enabled)); }
   getFrame() { return this.callApi('getFrame'); }
   cleanSlate(url) { return this.callApi('cleanSlate', url); }
@@ -3477,8 +3560,10 @@ class HyperFrame extends HTMLElement {
       : Date.now();
     const finalize = (ok, transport, error = null) => ({
       ok,
-      usable: this._usable,
-      ready: this._isReady,
+      state: this._state,
+      reason: this._stateReason,
+      usable: this._state === 'ready',
+      ready: this._state === 'ready',
       transport,
       sessionId: this.routingMid || null,
       timestamp: new Date().toISOString(),
@@ -3489,75 +3574,31 @@ class HyperFrame extends HTMLElement {
           : Date.now()) - startedAt),
       ),
       diagnostics: {
-        reconnecting: !this._isReady && !this._reconnectStopped,
+        reconnecting: this._state === 'connecting',
         lastErrorCode: error?.code || this._lastError?.code,
         lastErrorMessage: error?.message || this._lastError?.message,
       },
     });
     if (!this.iframe.contentWindow) {
-      this._setUsable(false, 'iframe-not-ready');
       const error = createBrowserBoxError('hyper-frame health check failed: iframe is not ready.', {
         code: ERROR_CODES.TRANSPORT,
         retriable: true,
         status: 503,
       });
-      this._rememberError(error);
       return finalize(false, this._transportMode, error);
     }
     const effectiveTimeoutMs = Number.isFinite(timeoutMs)
       ? Math.max(100, Math.round(timeoutMs))
       : Math.min(this.requestTimeoutMs, 8000);
-    const tryModern = () => this._request(
-      'bbx-api-call',
-      { method: 'getTabCount', args: [] },
-      { timeoutMs: effectiveTimeoutMs },
-    );
-    const tryLegacy = () => this._request('getTabCount', {}, { timeoutMs: effectiveTimeoutMs });
-
     try {
-      const result = await this._withRetry(async () => {
-        if (this._transportMode === 'modern') {
-          await tryModern();
-          return true;
-        }
-        if (this._transportMode === 'legacy') {
-          await tryLegacy();
-          return true;
-        }
-        try {
-          await tryModern();
-          this._transportMode = 'modern';
-          return true;
-        } catch (modernError) {
-          try {
-            await tryLegacy();
-            this._transportMode = 'legacy';
-            return true;
-          } catch (legacyError) {
-            const message = `hyper-frame health check failed after ${effectiveTimeoutMs}ms `
-              + `(modern error: ${modernError instanceof Error ? modernError.message : String(modernError)}; `
-              + `legacy error: ${legacyError instanceof Error ? legacyError.message : String(legacyError)})`;
-            throw createBrowserBoxError(message, {
-              code: ERROR_CODES.TRANSPORT,
-              retriable: true,
-              status: 503,
-              cause: legacyError,
-            });
-          }
-        }
-      }, {
-        attempts: 2,
-        baseDelayMs: 250,
-        maxDelayMs: 750,
-        shouldRetry: (error) => this._isRetryableApiError(error),
-      });
-      this._rememberError(null);
-      this._setUsable(true, 'health-ok');
-      return finalize(Boolean(result), this._transportMode);
+      await this._request(
+        'bbx-api-call',
+        { method: 'getTabCount', args: [] },
+        { timeoutMs: effectiveTimeoutMs },
+      );
+      return finalize(true, this._transportMode);
     } catch (error) {
       const normalizedError = this._normalizeRemoteError(error, { method: 'health' });
-      this._rememberError(normalizedError);
-      this._setUsable(false, 'health-failed');
       return finalize(false, this._transportMode, normalizedError);
     }
   }
@@ -3598,30 +3639,21 @@ class HyperFrame extends HTMLElement {
 
   refresh() {
     if (this.iframe.src) {
-      this._isReady = false;
       this._apiMethods = [];
       this._transportMode = 'unknown';
       this._legacyTabsCache = [];
-      this._reconnectStopped = false;
       this._midSyncAcked = false;
-      this._resetReadyPromise();
-      this._rejectPending(createBrowserBoxError('hyper-frame refreshed.', {
-        code: ERROR_CODES.TRANSPORT,
-        retriable: true,
-        status: 503,
-      }));
+      this._setState('connecting', 'refresh');
       const currentSrc = this.iframe.src;
       this._assignIframeSrc(currentSrc, 'refresh');
     }
   }
 
   async disconnect() {
-    this.stopReconnectAttempts('session.disconnect');
-    this._isReady = false;
     this._apiMethods = [];
     this._transportMode = 'unknown';
     this._legacyTabsCache = [];
-    this._resetReadyPromise();
+    this._setState('failed', 'session.disconnect');
     if (this.iframe.src) {
       this.iframe.removeAttribute('src');
     }
@@ -3632,16 +3664,7 @@ class HyperFrame extends HTMLElement {
   }
 
   stopReconnectAttempts(reason = 'manual-stop') {
-    this._reconnectStopped = true;
-    this._stopInitPing();
-    this._stopMidSync();
-    this._setUsable(false, reason);
-    this._rejectPending(createBrowserBoxError(`hyper-frame reconnect stopped (${reason}).`, {
-      code: ERROR_CODES.TRANSPORT,
-      retriable: true,
-      status: 503,
-      reason,
-    }));
+    this._setState('failed', reason);
   }
 
   /**
