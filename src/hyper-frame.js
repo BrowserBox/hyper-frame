@@ -1393,11 +1393,9 @@ class HyperFrame extends HTMLElement {
   }
 
   _isReconnectStopped() {
-    return this._state === 'failed' && (
-      this._stateReason === 'session.disconnect'
-      || this._stateReason === 'manual-stop'
-      || this._stateReason === 'iframe-unresponsive'
-    );
+    return this._state === 'failed'
+      && this._stateReason !== 'disconnected'
+      && !this._stateReason.startsWith('sos:');
   }
 
   _setState(nextState, reason = '') {
@@ -3581,7 +3579,8 @@ class HyperFrame extends HTMLElement {
   }
 
   stopReconnectAttempts(reason = 'manual-stop') {
-    this._setState('failed', reason);
+    const normalized = String(reason || 'manual-stop');
+    this._setState('failed', normalized === 'disconnected' ? 'manual-stop' : normalized);
   }
 
   /**
