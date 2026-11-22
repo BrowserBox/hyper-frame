@@ -1435,6 +1435,7 @@ class HyperFrame extends HTMLElement {
         this._rememberError(error);
         this._rejectPending(error);
       }
+      this._startInitPing();
       return;
     }
 
@@ -1889,7 +1890,6 @@ class HyperFrame extends HTMLElement {
     this._uiSyncAcked = false;
     this._startMidSync('iframe-load');
     this._sendUISync('iframe-load');
-    this._startInitPing();
   }
 
   _startInitPing() {
