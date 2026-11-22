@@ -353,13 +353,24 @@ function createTabsNamespace(instance) {
       const url = typeof input.url === 'string' ? input.url : '';
       const shouldActivate = input.active !== false;
       const previousActiveTab = shouldActivate ? null : await instance._getActiveTabInfo();
-      const beforeCount = await instance.callApi('getTabCount');
+      const before = new Set((await this.list()).map(tab => tab.id));
       await instance.callApi('createTab', url);
-      await instance.callApi('waitForTabCount', beforeCount + 1, {
-        timeoutMs: instance.requestTimeoutMs,
-      });
-      const tabs = await this.list();
-      const createdTab = tabs[tabs.length - 1] || null;
+      // The created tab is the one whose id was not there before. Waiting for an exact
+      // tab count ran into the request timeout whenever another tab opened or closed
+      // in the meantime (two overlapping create calls were enough).
+      const deadline = Date.now() + instance.requestTimeoutMs;
+      let createdTab = null;
+      while (createdTab === null) {
+        const added = (await this.list()).filter(tab => !before.has(tab.id));
+        createdTab = added[added.length - 1] || null;
+        if (createdTab !== null) break;
+        if (Date.now() >= deadline) {
+          throw createBrowserBoxError(
+            `tabs.create: no new tab appeared within ${instance.requestTimeoutMs}ms of createTab.`,
+            { retriable: true });
+        }
+        await new Promise(resolve => setTimeout(resolve, 150));
+      }
       if (!shouldActivate && previousActiveTab?.id) {
         await instance.callApi('switchToTabById', previousActiveTab.id);
       }
