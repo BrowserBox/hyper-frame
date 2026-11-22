@@ -599,7 +599,7 @@ function createSessionFacade(instance) {
     state: readOnlyProperty(() => instance._state),
     reason: readOnlyProperty(() => instance._stateReason),
     usable: readOnlyProperty(() => instance._state === 'ready'),
-    transport: readOnlyProperty(() => instance._transportMode),
+    transport: readOnlyProperty(() => 'modern'),
     ready: readOnlyProperty(() => instance._state === 'ready'),
     tabs: readOnlyProperty(() => instance.tabs),
     page: readOnlyProperty(() => instance.page),
@@ -1205,7 +1205,6 @@ class HyperFrame extends HTMLElement {
     this._stateReason = 'init';
     this._readyWaiters = new Set();
     this._initPingTimer = null;
-    this._transportMode = 'unknown';
     this._legacyTabsCache = [];
 
     // Iframe connection retry state
@@ -1316,7 +1315,6 @@ class HyperFrame extends HTMLElement {
     }
     if (name === 'login-link') {
       this._apiMethods = [];
-      this._transportMode = 'unknown';
       this._legacyTabsCache = [];
       this._iframeRetryCount = 0;
       this._initPingCount = 0;
@@ -1703,9 +1701,6 @@ class HyperFrame extends HTMLElement {
         if (!ready) {
           return false;
         }
-        if (this._transportMode === 'unknown') {
-          await this._resolveTransport();
-        }
         const activeTab = await this._getActiveTabInfo(null).catch(() => null);
         const tabId = activeTab?.id || activeTab?.targetId || null;
         if (!tabId) {
@@ -1738,20 +1733,16 @@ class HyperFrame extends HTMLElement {
         if (!activeAfterResetId || activeAfterResetId !== tabId) {
           return false;
         }
-        if (this._transportMode === 'legacy') {
-          await this._legacyCall('switchToTabById', [tabId]);
-        } else {
-          await this._request('bbx-api-call', {
-            method: 'switchToTabById',
-            args: [tabId],
-          }, {
-            timeoutMs: Math.min(this.requestTimeoutMs, 5000),
-          });
-        }
+        await this._request('bbx-api-call', {
+          method: 'switchToTabById',
+          args: [tabId],
+        }, {
+          timeoutMs: Math.min(this.requestTimeoutMs, 5000),
+        });
         this._lastSuccessfulBootstrapAt = Date.now();
         console.info(`[hyper-frame] bootstrapped frame (${reason})`, {
           tabId,
-          transport: this._transportMode,
+          transport: 'modern',
           kickedViewportGeometry,
           forcedViewportReset,
         });
@@ -1885,7 +1876,6 @@ class HyperFrame extends HTMLElement {
     }
     const wasReady = this._state === 'ready';
     this._apiMethods = [];
-    this._transportMode = 'unknown';
     this._legacyTabsCache = [];
     this._initPingCount = 0;
     this._lastSuccessfulBootstrapAt = 0;
@@ -1995,7 +1985,6 @@ class HyperFrame extends HTMLElement {
 
     this._silentRecoveryUsed = true;
     this._apiMethods = [];
-    this._transportMode = 'unknown';
     this._legacyTabsCache = [];
     this._iframeRetryCount = 0;
     this._initPingCount = 0;
@@ -2589,12 +2578,6 @@ class HyperFrame extends HTMLElement {
     for (const capability of this._capabilitiesForMethod(normalizedMethod, args)) {
       this._assertCapability(capability);
     }
-    if (this._transportMode === 'unknown') {
-      await this._resolveTransport();
-    }
-    if (this._transportMode === 'legacy') {
-      return this._legacyCall(normalizedMethod, args);
-    }
     return this._request('bbx-api-call', { method: normalizedMethod, args }, requestOptions);
   }
 
@@ -3000,14 +2983,9 @@ class HyperFrame extends HTMLElement {
       return;
     }
 
-    if (payload.type === 'tab-api-ready') {
-      return;
-    }
-
     if (payload.type === 'bbx-api-ready') {
       if (Array.isArray(payload.data?.methods)) {
         this._apiMethods = payload.data.methods.slice();
-        this._transportMode = 'modern';
       }
       if (payload.data?.policy) {
         this._serverPolicySnapshot = normalizePolicyStateSnapshot(payload.data.policy);
@@ -3312,78 +3290,24 @@ class HyperFrame extends HTMLElement {
     }
   }
 
-  _legacyMethodList() {
-    return [
-      'getTabs',
-      'getActiveTabIndex',
-      'getTabCount',
-      'createTab',
-      'createTabs',
-      'closeTab',
-      'closeTabById',
-      'closeAllTabs',
-      'switchToTab',
-      'switchToTabById',
-      'navigateTo',
-      'navigateTab',
-      'submitOmnibox',
-      'reload',
-      'goBack',
-      'goForward',
-      'stop',
-      'evaluate',
-      'waitForTabCount',
-      'waitForTabUrl',
-    ];
-  }
-
-  /**
-   * Resolve transport mode. Called once on first API call if transport is
-   * still 'unknown'. After resolution, transport is locked for the session.
-   * @returns {Promise<'modern'|'legacy'>}
-   */
-  async _resolveTransport() {
-    if (this._transportMode !== 'unknown') return this._transportMode;
-    try {
-      await this._request('bbx-api-call', { method: 'getTabCount', args: [] }, {
-        timeoutMs: Math.min(this.requestTimeoutMs, 5000),
-      });
-      this._transportMode = 'modern';
-    } catch {
-      this._transportMode = 'legacy';
-    }
-    return this._transportMode;
-  }
-
   async listApiMethods(options = {}) {
     if (this._apiMethods.length > 0 && options.refresh !== true) {
       return this._apiMethods.slice();
     }
     const ready = await this._ensureReadyForApi();
     if (!ready) {
-      throw createBrowserBoxError('hyper-frame API handshake is not ready.', {
-        code: ERROR_CODES.NOT_READY,
+      throw this._createNotReadyError('hyper-frame API handshake is not ready.', {
+        reason: this._stateReason,
         retriable: true,
-        status: 409,
       });
     }
-    if (this._transportMode === 'legacy') {
-      this._apiMethods = this._legacyMethodList();
-      return this._apiMethods.slice();
-    }
-    try {
-      const methods = await this._request('bbx-api-list', {}, {
-        ...options,
-        timeoutMs: Number.isFinite(options.timeoutMs)
-          ? options.timeoutMs
-          : Math.min(this.requestTimeoutMs, 30000),
-      });
-      this._apiMethods = Array.isArray(methods) ? methods.slice() : [];
-      this._transportMode = 'modern';
-    } catch {
-      this._transportMode = 'legacy';
-      this._apiMethods = this._legacyMethodList();
-    }
+    const methods = await this._request('bbx-api-list', {}, {
+      ...options,
+      timeoutMs: Number.isFinite(options.timeoutMs)
+        ? options.timeoutMs
+        : Math.min(this.requestTimeoutMs, 30000),
+    });
+    this._apiMethods = Array.isArray(methods) ? methods.slice() : [];
     return this._apiMethods.slice();
   }
 
@@ -3414,16 +3338,9 @@ class HyperFrame extends HTMLElement {
       for (const capability of this._capabilitiesForMethod(normalizedMethod, args)) {
         this._assertCapability(capability);
       }
-
-      if (this._transportMode === 'unknown') {
-        await this._resolveTransport();
-      }
-
-      const result = this._transportMode === 'legacy'
-        ? await this._legacyCall(normalizedMethod, args)
-        : await this._request('bbx-api-call', { method: normalizedMethod, args }, {
-          timeoutMs: this.requestTimeoutMs,
-        });
+      const result = await this._request('bbx-api-call', { method: normalizedMethod, args }, {
+        timeoutMs: this.requestTimeoutMs,
+      });
       this._rememberError(null);
       return result;
     } catch (error) {
@@ -3558,13 +3475,13 @@ class HyperFrame extends HTMLElement {
     const startedAt = (typeof performance !== 'undefined' && typeof performance.now === 'function')
       ? performance.now()
       : Date.now();
-    const finalize = (ok, transport, error = null) => ({
+    const finalize = (ok, error = null) => ({
       ok,
       state: this._state,
       reason: this._stateReason,
       usable: this._state === 'ready',
       ready: this._state === 'ready',
-      transport,
+      transport: 'modern',
       sessionId: this.routingMid || null,
       timestamp: new Date().toISOString(),
       latencyMs: Math.max(
@@ -3585,7 +3502,7 @@ class HyperFrame extends HTMLElement {
         retriable: true,
         status: 503,
       });
-      return finalize(false, this._transportMode, error);
+      return finalize(false, error);
     }
     const effectiveTimeoutMs = Number.isFinite(timeoutMs)
       ? Math.max(100, Math.round(timeoutMs))
@@ -3596,10 +3513,10 @@ class HyperFrame extends HTMLElement {
         { method: 'getTabCount', args: [] },
         { timeoutMs: effectiveTimeoutMs },
       );
-      return finalize(true, this._transportMode);
+      return finalize(true);
     } catch (error) {
       const normalizedError = this._normalizeRemoteError(error, { method: 'health' });
-      return finalize(false, this._transportMode, normalizedError);
+      return finalize(false, normalizedError);
     }
   }
 
@@ -3640,7 +3557,6 @@ class HyperFrame extends HTMLElement {
   refresh() {
     if (this.iframe.src) {
       this._apiMethods = [];
-      this._transportMode = 'unknown';
       this._legacyTabsCache = [];
       this._midSyncAcked = false;
       this._setState('connecting', 'refresh');
@@ -3651,7 +3567,6 @@ class HyperFrame extends HTMLElement {
 
   async disconnect() {
     this._apiMethods = [];
-    this._transportMode = 'unknown';
     this._legacyTabsCache = [];
     this._setState('failed', 'session.disconnect');
     if (this.iframe.src) {
@@ -3701,16 +3616,12 @@ class HyperFrame extends HTMLElement {
         this.requestFrameRefresh(reason);
         return false;
       }
-      if (this._transportMode === 'legacy') {
-        await this._legacyCall('switchToTabById', [tabId]);
-      } else {
-        await this._request('bbx-api-call', {
-          method: 'switchToTabById',
-          args: [tabId],
-        }, {
-          timeoutMs: Math.min(this.requestTimeoutMs, 5000),
-        });
-      }
+      await this._request('bbx-api-call', {
+        method: 'switchToTabById',
+        args: [tabId],
+      }, {
+        timeoutMs: Math.min(this.requestTimeoutMs, 5000),
+      });
       console.info('[hyper-frame] reactivateActiveTab succeeded', { reason, tabId });
       return true;
     } catch (error) {
@@ -3798,254 +3709,6 @@ class HyperFrame extends HTMLElement {
     }
     this.setAttribute('request-timeout-ms', String(value));
   }
-
-  /**
-   * Legacy transport dispatch. Each handler is a small function in a lookup
-   * table — avoids the 180-line if/else chain (Architecture §6, §3).
-   * @param {string} method
-   * @param {Array} args
-   * @param {Error|null} originalError
-   * @returns {Promise<*>}
-   */
-  async _legacyCall(method, args = [], originalError = null) {
-    const handler = this._legacyHandlers[method];
-    if (!handler) {
-      const detail = originalError?.message ? ` (${originalError.message})` : '';
-      throw createBrowserBoxError(`No legacy fallback for API method '${method}'${detail}`, {
-        code: ERROR_CODES.UNSUPPORTED,
-        status: 501,
-        method,
-        ...(originalError ? { cause: originalError } : {}),
-      });
-    }
-    return handler.call(this, args, originalError);
-  }
-
-  get _legacyHandlers() {
-    if (this.__legacyHandlers) return this.__legacyHandlers;
-    const self = this;
-
-    const fail = (message, originalError = null) => {
-      const detail = originalError?.message ? ` (${originalError.message})` : '';
-      throw self._normalizeRemoteError(
-        createBrowserBoxError(`${message}${detail}`, {
-          code: ERROR_CODES.INTERNAL,
-          status: 500,
-          ...(originalError ? { cause: originalError } : {}),
-        }),
-      );
-    };
-
-    const resolveTabId = async (indexArg = null) => {
-      if (typeof indexArg === 'string' && indexArg.trim().length > 0) return indexArg.trim();
-      const tabs = await self._legacyHandlers.getTabs.call(self, []);
-      if (Array.isArray(tabs) && tabs.length > 0) {
-        const requested = Number.isInteger(indexArg) ? indexArg : 0;
-        const normalized = requested < 0 ? tabs.length + requested : requested;
-        const safeIndex = Math.max(0, Math.min(tabs.length - 1, normalized));
-        return tabs[safeIndex]?.id || tabs[safeIndex]?.targetId || null;
-      }
-      const activeTab = await self._request('getActiveTab', {}).catch(() => null);
-      return activeTab?.id || activeTab?.targetId || null;
-    };
-
-    this.__legacyHandlers = {
-      async getTabs() {
-        let tabs;
-        try {
-          tabs = await self._request('getTabs', {});
-        } catch {
-          tabs = self._legacyTabsCache.slice();
-        }
-        if (!Array.isArray(tabs)) return self._legacyTabsCache.slice();
-        const normalizedTabs = tabs.map((tab, index) => ({ index, ...tab }));
-        self._legacyTabsCache = normalizedTabs.slice();
-        return normalizedTabs;
-      },
-
-      async getActiveTabIndex() {
-        const [tabs, activeTab] = await Promise.all([
-          self._legacyHandlers.getTabs.call(self, []),
-          self._request('getActiveTab', {}).catch(() => null),
-        ]);
-        if (!activeTab || !Array.isArray(tabs)) return -1;
-        const activeId = activeTab.id || activeTab.targetId || null;
-        return tabs.findIndex((tab) => (tab.id || tab.targetId) === activeId);
-      },
-
-      async getTabCount() {
-        const tabs = await self._legacyHandlers.getTabs.call(self, []);
-        return Array.isArray(tabs) ? tabs.length : 0;
-      },
-
-      async createTab(args) {
-        const url = typeof args[0] === 'string' ? args[0] : '';
-        self._postRaw({ type: 'createTab', data: { url } });
-        return true;
-      },
-
-      async createTabs(args) {
-        const count = Number.isInteger(args[0]) && args[0] > 0 ? args[0] : 0;
-        const opts = args[1] || {};
-        const url = typeof opts.url === 'string' ? opts.url : '';
-        for (let i = 0; i < count; i += 1) {
-          self._postRaw({ type: 'createTab', data: { url } });
-        }
-        return true;
-      },
-
-      async closeTab(args, originalError) {
-        const tabId = await resolveTabId(args[0]);
-        if (!tabId) fail('Legacy closeTab failed: no target tab', originalError);
-        self._postRaw({ type: 'closeTab', tabId, data: {} });
-        return true;
-      },
-
-      async closeTabById(args, originalError) {
-        const tabId = typeof args[0] === 'string' && args[0].trim().length > 0 ? args[0].trim() : null;
-        if (!tabId) fail('Legacy closeTabById requires a non-empty targetId string', originalError);
-        self._postRaw({ type: 'closeTab', tabId, data: {} });
-        return true;
-      },
-
-      async closeAllTabs(args) {
-        const opts = args[0] || {};
-        const keep = Number.isInteger(opts.keep) ? Math.max(0, opts.keep) : 0;
-        const tabs = await self._legacyHandlers.getTabs.call(self, []);
-        if (!Array.isArray(tabs) || tabs.length <= keep) return tabs?.length || 0;
-        for (let i = tabs.length - 1; i >= keep; i -= 1) {
-          const tabId = tabs[i]?.id || tabs[i]?.targetId;
-          if (!tabId) continue;
-          self._postRaw({ type: 'closeTab', tabId, data: {} });
-        }
-        return Math.max(keep, 0);
-      },
-
-      async switchToTab(args, originalError) {
-        const tabId = await resolveTabId(args[0]);
-        if (!tabId) fail('Legacy switchToTab failed: no target tab', originalError);
-        self._postRaw({ type: 'setActiveTab', tabId, data: {} });
-        return true;
-      },
-
-      async switchToTabById(args, originalError) {
-        const tabId = typeof args[0] === 'string' && args[0].trim().length > 0 ? args[0].trim() : null;
-        if (!tabId) fail('Legacy switchToTabById requires a non-empty targetId string', originalError);
-        self._postRaw({ type: 'setActiveTab', tabId, data: {} });
-        return true;
-      },
-
-      async navigateTo(args, originalError) {
-        const url = typeof args[0] === 'string' ? args[0] : '';
-        const tabId = await resolveTabId(null);
-        if (!tabId) fail('Legacy navigateTo failed: no active tab', originalError);
-        self._postRaw({ type: 'loadURL', tabId, data: { url } });
-        return true;
-      },
-
-      async navigateTab(args, originalError) {
-        const tabId = await resolveTabId(args[0]);
-        const url = typeof args[1] === 'string' ? args[1] : '';
-        if (!tabId) fail('Legacy navigateTab failed: no target tab', originalError);
-        self._postRaw({ type: 'setActiveTab', tabId, data: {} });
-        self._postRaw({ type: 'loadURL', tabId, data: { url } });
-        return true;
-      },
-
-      async submitOmnibox(args, originalError) {
-        const query = typeof args[0] === 'string' ? args[0] : '';
-        return self._legacyHandlers.navigateTo.call(self, [query], originalError);
-      },
-
-      async reload(args, originalError) {
-        const tabId = await resolveTabId(null);
-        if (!tabId) fail('Legacy reload failed: no active tab', originalError);
-        self._postRaw({ type: 'reload', tabId, data: {} });
-        return true;
-      },
-
-      async goBack(args, originalError) {
-        const tabId = await resolveTabId(null);
-        if (!tabId) fail('Legacy goBack failed: no active tab', originalError);
-        self._postRaw({ type: 'goBack', tabId, data: {} });
-        return true;
-      },
-
-      async goForward(args, originalError) {
-        const tabId = await resolveTabId(null);
-        if (!tabId) fail('Legacy goForward failed: no active tab', originalError);
-        self._postRaw({ type: 'goForward', tabId, data: {} });
-        return true;
-      },
-
-      async stop(args, originalError) {
-        const tabId = await resolveTabId(null);
-        if (!tabId) fail('Legacy stop failed: no active tab', originalError);
-        self._postRaw({ type: 'stop', tabId, data: {} });
-        return true;
-      },
-
-      async evaluate(args, originalError) {
-        const expression = typeof args[0] === 'string' ? args[0] : '';
-        const tabId = await resolveTabId(null);
-        if (!tabId) fail('Legacy evaluate failed: no active tab', originalError);
-        if (expression.includes('history.back')) {
-          self._postRaw({ type: 'goBack', tabId, data: {} });
-          return true;
-        }
-        if (expression.includes('history.forward')) {
-          self._postRaw({ type: 'goForward', tabId, data: {} });
-          return true;
-        }
-        if (expression.includes('window.stop')) {
-          self._postRaw({ type: 'stop', tabId, data: {} });
-          return true;
-        }
-        fail('Legacy evaluate only supports history.back, history.forward, and window.stop', originalError);
-      },
-
-      async waitForTabCount(args, originalError) {
-        const expectedCount = Number.isInteger(args[0]) ? args[0] : 0;
-        const opts = args[1] || {};
-        const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : self.requestTimeoutMs;
-        const pollMs = Number.isFinite(opts.pollMs) ? Math.max(50, opts.pollMs) : 150;
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          const tabs = await self._legacyHandlers.getTabs.call(self, []);
-          if (tabs.length === expectedCount) return tabs.length;
-          await new Promise((resolve) => setTimeout(resolve, pollMs));
-        }
-        fail(`Legacy waitForTabCount timed out waiting for ${expectedCount}`, originalError);
-      },
-
-      async waitForTabUrl(args, originalError) {
-        const tabIndex = Number.isInteger(args[0]) ? args[0] : 0;
-        const opts = args[1] || {};
-        const timeoutMs = Number.isFinite(opts.timeoutMs) ? opts.timeoutMs : self.requestTimeoutMs;
-        const pollMs = Number.isFinite(opts.pollMs) ? Math.max(50, opts.pollMs) : 150;
-        const expectIncludes = typeof opts.expectIncludes === 'string' ? opts.expectIncludes : '';
-        const allowBlank = Boolean(opts.allowBlank);
-        const deadline = Date.now() + timeoutMs;
-        while (Date.now() < deadline) {
-          const tabs = await self._legacyHandlers.getTabs.call(self, []);
-          if (Array.isArray(tabs) && tabs.length > 0) {
-            const safeIndex = Math.max(0, Math.min(tabs.length - 1, tabIndex));
-            const url = tabs[safeIndex]?.url || '';
-            if (allowBlank || url) {
-              if (!expectIncludes || url.includes(expectIncludes)) {
-                return { index: safeIndex, id: tabs[safeIndex]?.id || tabs[safeIndex]?.targetId, url };
-              }
-            }
-          }
-          await new Promise((resolve) => setTimeout(resolve, pollMs));
-        }
-        fail(`Legacy waitForTabUrl timed out for tab ${tabIndex}`, originalError);
-      },
-    };
-
-    return this.__legacyHandlers;
-  }
-
 }
 
 if (!customElements.get('hyper-frame')) {
