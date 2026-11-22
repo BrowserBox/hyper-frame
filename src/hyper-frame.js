@@ -1268,6 +1268,9 @@ class HyperFrame extends HTMLElement {
   }
 
   connectedCallback() {
+    if (this._state === 'failed' && this._stateReason === 'disconnected') {
+      this._setState('connecting', 'reconnected');
+    }
     window.addEventListener('message', this._boundMessage);
     window.addEventListener('resize', this._boundResize);
     window.addEventListener('pageshow', this._boundPageShow);
@@ -1394,7 +1397,6 @@ class HyperFrame extends HTMLElement {
       this._stateReason === 'session.disconnect'
       || this._stateReason === 'manual-stop'
       || this._stateReason === 'iframe-unresponsive'
-      || this._stateReason === 'disconnected'
     );
   }
 
