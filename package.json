@@ -1,6 +1,6 @@
 {
   "name": "@browserbox/hyper-frame",
-  "version": "3.1.0",
+  "version": "4.0.0",
   "author": "@dosy",
   "description": "Hyper-Frame — an iframe that can frame any website",
   "type": "module",
