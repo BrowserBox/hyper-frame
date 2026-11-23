@@ -338,6 +338,7 @@ function createLocalPolicySnapshot(capabilities, metadata = {}) {
 }
 
 function createTabsNamespace(instance) {
+  let createTail = Promise.resolve();
   return Object.freeze({
     async list() {
       const tabs = await instance.callApi('getTabs');
@@ -348,33 +349,39 @@ function createTabsNamespace(instance) {
     async getActive() {
       return instance._getActiveTabInfo();
     },
-    async create(input = {}) {
-      assertPlainObject(input, 'tabs.create(input)');
-      const url = typeof input.url === 'string' ? input.url : '';
-      const shouldActivate = input.active !== false;
-      const previousActiveTab = shouldActivate ? null : await instance._getActiveTabInfo();
-      const before = new Set((await this.list()).map(tab => tab.id));
-      await instance.callApi('createTab', url);
-      // The created tab is the one whose id was not there before. Waiting for an exact
-      // tab count ran into the request timeout whenever another tab opened or closed
-      // in the meantime (two overlapping create calls were enough).
-      const deadline = Date.now() + instance.requestTimeoutMs;
-      let createdTab = null;
-      while (createdTab === null) {
-        const added = (await this.list()).filter(tab => !before.has(tab.id));
-        createdTab = added[added.length - 1] || null;
-        if (createdTab !== null) break;
-        if (Date.now() >= deadline) {
-          throw createBrowserBoxError(
-            `tabs.create: no new tab appeared within ${instance.requestTimeoutMs}ms of createTab.`,
-            { retriable: true });
+    create(input = {}) {
+      // createTab has no request-correlated tab ID. Keep the snapshot, command,
+      // and discovery together so two callers cannot claim the same new tab.
+      const created = createTail.then(async () => {
+        assertPlainObject(input, 'tabs.create(input)');
+        const url = typeof input.url === 'string' ? input.url : '';
+        const shouldActivate = input.active !== false;
+        const previousActiveTab = shouldActivate ? null : await instance._getActiveTabInfo();
+        const before = new Set((await this.list()).map(tab => tab.id));
+        await instance.callApi('createTab', url);
+        // The created tab is the one whose id was not there before. Waiting for an exact
+        // tab count ran into the request timeout whenever another tab opened or closed
+        // in the meantime (two overlapping create calls were enough).
+        const deadline = Date.now() + instance.requestTimeoutMs;
+        let createdTab = null;
+        while (createdTab === null) {
+          const added = (await this.list()).filter(tab => !before.has(tab.id));
+          createdTab = added[added.length - 1] || null;
+          if (createdTab !== null) break;
+          if (Date.now() >= deadline) {
+            throw createBrowserBoxError(
+              `tabs.create: no new tab appeared within ${instance.requestTimeoutMs}ms of createTab.`,
+              { retriable: true });
+          }
+          await new Promise(resolve => setTimeout(resolve, 150));
         }
-        await new Promise(resolve => setTimeout(resolve, 150));
-      }
-      if (!shouldActivate && previousActiveTab?.id) {
-        await instance.callApi('switchToTabById', previousActiveTab.id);
-      }
-      return createdTab;
+        if (!shouldActivate && previousActiveTab?.id) {
+          await instance.callApi('switchToTabById', previousActiveTab.id);
+        }
+        return createdTab;
+      });
+      createTail = created.catch(() => {});
+      return created;
     },
     async activate(tabId) {
       return instance.callApi('switchToTabById', assertNonEmptyString(tabId, 'tabs.activate(tabId)'));
